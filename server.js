@@ -1,8 +1,8 @@
-
 const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
 const path = require('path');
+const db = require('./db');
 
 const app = express();
 const server = http.createServer(app);
@@ -11,103 +11,132 @@ const io = new Server(server);
 // Serve static files from 'public' directory
 app.use(express.static(path.join(__dirname, 'public')));
 
-let players = [];
-let gameConfig = {
-    totalPlayers: 0,
-    wolfCount: 0
-};
-let gameStarted = false;
+// Initialize DB
+db.initDB();
 
-io.on('connection', (socket) => {
+io.on('connection', async (socket) => {
     console.log('A user connected:', socket.id);
 
-    // Send current state to new player
-    socket.emit('gameState', {
-        players: players,
-        config: gameConfig,
-        started: gameStarted,
-        isHost: players.length === 0 // First player is host
-    });
+    try {
+        const players = await db.getPlayers();
+        const gameState = await db.getGameState();
 
-    socket.on('join', (playerName) => {
-        if (gameStarted) {
-            socket.emit('error', 'Game already started');
-            return;
-        }
+        // Convert config from JSON if needed (mysql2 handles this but checks safety)
+        let config = gameState.config;
+        if (typeof config === 'string') config = JSON.parse(config);
 
-        const existingPlayer = players.find(p => p.id === socket.id);
-        if (existingPlayer) {
-            existingPlayer.name = playerName;
-        } else {
-            players.push({ id: socket.id, name: playerName, role: null });
-        }
-
-        io.emit('updatePlayers', players);
-
-        // If this was the first player, tell them they are host
-        if (players.length === 1) {
-            socket.emit('isHost', true);
-        }
-    });
-
-    socket.on('setConfig', (config) => {
-        // Ideally checking if sender is host, but for simplicity allowing update
-        gameConfig = config;
-        io.emit('configUpdated', gameConfig);
-    });
-
-    socket.on('startGame', () => {
-        if (players.length < gameConfig.totalPlayers) {
-            socket.emit('error', `Waiting for more players. Need ${gameConfig.totalPlayers}, have ${players.length}`);
-            return;
-        }
-
-        assignRoles();
-        gameStarted = true;
-        io.emit('gameStarted');
-
-        // Reveal roles
-        players.forEach(player => {
-            io.to(player.id).emit('roleAssigned', player.role);
+        // Send current state to new player
+        socket.emit('gameState', {
+            players: players,
+            config: config,
+            started: gameState.status === 'playing',
+            isHost: players.length === 0 // This logic might need tweak since DB persists, but on connect if no players in DB, first one is host.
         });
+    } catch (e) {
+        console.error("Error fetching initial state:", e);
+    }
+
+    socket.on('join', async (playerName) => {
+        try {
+            const gameState = await db.getGameState();
+            if (gameState.status === 'playing') {
+                socket.emit('error', 'Game already started');
+                return;
+            }
+
+            const players = await db.getPlayers();
+            // Check if player already exists (by socket ID simple check) - technically new socket ID on reconnect
+            // For now, just add new player
+
+            const isFirst = players.length === 0;
+            await db.addPlayer(socket.id, playerName, isFirst);
+
+            const updatedPlayers = await db.getPlayers();
+            io.emit('updatePlayers', updatedPlayers);
+
+            if (isFirst) {
+                socket.emit('isHost', true);
+            }
+        } catch (e) {
+            console.error("Error joining:", e);
+        }
     });
 
-    socket.on('disconnect', () => {
-        console.log('User disconnected:', socket.id);
-        players = players.filter(p => p.id !== socket.id);
-        io.emit('updatePlayers', players);
+    socket.on('setConfig', async (config) => {
+        try {
+            await db.updateGameConfig(config);
+            io.emit('configUpdated', config);
+        } catch (e) {
+            console.error("Error setting config:", e);
+        }
+    });
 
-        // If host disconnected, assign new host if any players remain
-        if (players.length > 0) {
-            io.to(players[0].id).emit('isHost', true);
-        } else {
-            // Reset game if everyone leaves
-            gameStarted = false;
+    socket.on('startGame', async () => {
+        try {
+            const players = await db.getPlayers();
+            const gameState = await db.getGameState();
+            let config = gameState.config;
+            if (typeof config === 'string') config = JSON.parse(config);
+
+            if (players.length < config.totalPlayers) {
+                socket.emit('error', `Waiting for more players. Need ${config.totalPlayers}, have ${players.length}`);
+                return;
+            }
+
+            await assignRoles(players, config);
+            await db.updateGameStatus('playing');
+
+            io.emit('gameStarted');
+
+            // Reveal roles and update DB
+            const updatedPlayers = await db.getPlayers(); // fetch again to get roles
+            updatedPlayers.forEach(player => {
+                // Find socket to emit to
+                io.to(player.socket_id).emit('roleAssigned', player.role);
+            });
+        } catch (e) {
+            console.error("Error starting game:", e);
+        }
+    });
+
+    socket.on('disconnect', async () => {
+        console.log('User disconnected:', socket.id);
+        try {
+            await db.removePlayer(socket.id);
+            const players = await db.getPlayers();
+
+            io.emit('updatePlayers', players);
+
+            // If host left, assign new host (logic simplification: if anyone remains, make the first one host)
+            if (players.length > 0) {
+                // Creating a 'host' flag in DB would be better, but for now just tell the first one
+                io.to(players[0].socket_id).emit('isHost', true);
+            } else {
+                // Reset game if everyone leaves
+                await db.updateGameStatus('waiting');
+            }
+        } catch (e) {
+            console.error("Error disconnecting:", e);
         }
     });
 });
 
-function assignRoles() {
+async function assignRoles(players, config) {
     let roles = [];
 
     // Always add Wolves
-    for (let i = 0; i < gameConfig.wolfCount; i++) {
+    for (let i = 0; i < config.wolfCount; i++) {
         roles.push('Werewolf');
     }
 
-    // Add Special Roles if enough players (Logic: Need enough villagers to hide)
-    // Seer needs at least wolfCount + 2 players total usually, but let's be flexible
-    // Rule: If remaining slots > 0, add Seer.
     if (roles.length < players.length) {
         roles.push('Seer');
     }
 
-    // Guardian if we still have space
     if (roles.length < players.length) {
         roles.push('Guardian');
     }
 
-    // Fill the rest with Villagers
     while (roles.length < players.length) {
         roles.push('Villager');
     }
@@ -115,12 +144,12 @@ function assignRoles() {
     // Shuffle roles
     roles = roles.sort(() => Math.random() - 0.5);
 
-    // Assign to players
-    players.forEach((player, index) => {
-        player.role = roles[index];
-    });
+    // Assign to players in DB
+    for (let i = 0; i < players.length; i++) {
+        await db.updatePlayerRole(players[i].socket_id, roles[i]);
+    }
 
-    console.log("Roles assigned:", players.map(p => `${p.name}: ${p.role}`));
+    console.log("Roles assigned");
 }
 
 const PORT = process.env.PORT || 3000;
